@@ -10,7 +10,9 @@ const builtin = @import("builtin");
 pub const Library = enum { SDL2, SDL2_ttf };
 
 pub fn build(b: *std.Build) !void {
-    const sdk = Sdk.init(b, .{ .dep_name = null });
+    const sdk = Sdk.init(b, .{
+        .dep_name = null,
+    });
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -103,6 +105,10 @@ pub fn build(b: *std.Build) !void {
 
     const run_demo_native_step = b.step("run-native", "Runs the demo for the SDL2 native library");
     run_demo_native_step.dependOn(&run_demo_native.step);
+
+    // export lib
+    b.modules.put("native", sdk.getNativeModule()) catch @panic("OOM");
+    b.modules.put("wrapper", sdk.getWrapperModule()) catch @panic("OOM");
 }
 
 const host_system = @import("builtin").target;
@@ -245,10 +251,27 @@ fn linkWindows(
     exe: *Compile,
     linkage: std.builtin.LinkMode,
     comptime library: Library,
-    paths: Paths,
+    //paths: Paths,
 ) !void {
-    exe.addIncludePath(.{ .cwd_relative = paths.include });
-    exe.addLibraryPath(.{ .cwd_relative = paths.libs });
+    const windows_dll_prebuilt = sdk.builder.lazyDependency("sdl2_windows_prebuilt", .{}) orelse return;
+
+    const prebuilt_subdir = switch (exe.rootModuleTarget().cpu.arch) {
+        .x86 => "i686-w64-mingw32",
+        .x86_64 => "x86_64-w64-mingw32",
+        else => return error.UnsupportArch,
+    };
+
+    const fetched_dep = windows_dll_prebuilt.path(prebuilt_subdir);
+    const b = sdk.builder;
+
+    const paths = .{
+        .include = fetched_dep.path(b, "include"),
+        .libs = fetched_dep.path(b, "lib"),
+        .bin = fetched_dep.path(b, "bin"),
+    };
+
+    exe.addIncludePath(paths.include);
+    exe.addLibraryPath(paths.libs);
 
     const lib_name = switch (library) {
         .SDL2 => "SDL2",
@@ -264,10 +287,9 @@ fn linkWindows(
         });
         defer sdk.builder.allocator.free(file_name);
 
-        const lib_path = try std.fs.path.join(sdk.builder.allocator, &[_][]const u8{ paths.libs, file_name });
-        defer sdk.builder.allocator.free(lib_path);
+        const lib_path = paths.libs.path(sdk.builder, file_name);
 
-        exe.addObjectFile(.{ .cwd_relative = lib_path });
+        exe.addObjectFile(lib_path);
 
         if (linkage == .static and library == .SDL2) {
             const static_libs = [_][]const u8{
@@ -290,10 +312,9 @@ fn linkWindows(
         const dll_name = try std.fmt.allocPrint(sdk.builder.allocator, "{s}.dll", .{lib_name});
         defer sdk.builder.allocator.free(dll_name);
 
-        const dll_path = try std.fs.path.join(sdk.builder.allocator, &[_][]const u8{ paths.bin, dll_name });
-        defer sdk.builder.allocator.free(dll_path);
+        const dll_path = paths.bin.path(sdk.builder, dll_name);
 
-        const install_bin = sdk.builder.addInstallBinFile(.{ .cwd_relative = dll_path }, dll_name);
+        const install_bin = sdk.builder.addInstallBinFile(dll_path, dll_name);
         exe.step.dependOn(&install_bin.step);
     }
 }
@@ -357,14 +378,7 @@ pub fn link(
             });
         }
     } else if (target.result.os.tag == .windows) {
-        const paths = switch (library) {
-            .SDL2 => getPaths(sdk, sdk.sdl_config_path, target, .SDL2),
-            .SDL2_ttf => getPaths(sdk, sdk.sdl_ttf_config_path, target, .SDL2_ttf),
-        } catch |err| {
-            std.debug.panic("Failed to get paths for {s}: {s}", .{ @tagName(library), @errorName(err) });
-        };
-
-        linkWindows(sdk, exe, linkage, library, paths) catch |err| {
+        linkWindows(sdk, exe, linkage, library) catch |err| {
             std.debug.panic("Failed to link {s} for Windows: {s}", .{ @tagName(library), @errorName(err) });
         };
     } else if (target.result.isDarwinLibC()) {
